@@ -1,0 +1,141 @@
+#!/bin/bash
+#SBATCH --job-name=bestof-jaxtime-h200
+#SBATCH --array=0-1
+#SBATCH --partition=gpu_h200
+#SBATCH --nodes=1
+#SBATCH --gpus=4
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=8
+#SBATCH --mem=256G
+#SBATCH --time=24:00:00
+#SBATCH --signal=B:TERM@300
+#SBATCH --output=bestof-jaxtime-h200-%A_%a.out
+
+# JAX certified mini-batch (`jax_mb_cert`), FLOAT64, H200 -- the TIMING RERUN with the
+# compile-in-clock bug fixed. Array task 0 = random_centroid, task 1 = random_partition.
+#
+# *** WHAT WAS WRONG WITH THE EARLIER JAX TIMINGS. *** The warm-up compiled a fixed list of XLA
+# executables that did not match what the certified runner times. The timed run uses
+# _resume_minibatch_inner with (max_iters=1000, tolerance=0) plus the fixed-point check; the
+# warm-up built tolerance=floor(0.01*n) and max_iters=2 variants instead. So for n >= 100 the
+# FIRST timed start of every (process, shape, batch fraction) compiled inside its clock (~1 s on
+# the H200), and the check compiled inside the clock at p=0.25 at every n (~0.2 s). It showed up
+# as one slow start in the first dataset each GPU process ran per regime (dataset_ids 0-7 in the
+# 8-GPU random-centroid job 22098066, 0-3 in the 4-GPU random-partition job 26508324),
+# inflating JAX mean runtimes by a median of 39% at n >= 134. Quality was never affected.
+#
+# *** WHAT CHANGED (bestof_init_benchmark.py, jax_minibatch_hartigan.py). ***
+#  1. Warm-up = the runner's own timed code, run once untimed per (process, shape, batch
+#     fraction) on the dataset about to be timed (_warm_jax_runner). It compiles exactly what the
+#     timed starts use and nothing else: the tolerance driver, the epoch-2 step and the
+#     2-iteration variant the old warm-up built are no longer compiled.
+#  2. Per-iteration time is measured INSIDE the certified run: the clock starts once
+#     initialization is done and covers the mini-batch iterations plus the checks they trigger;
+#     singleit = that / n_iters (n_iters counts mini-batch iterations only, not initialization).
+#     Same definition as numba_mb_cert. The separate tolerance-stopped rerun of every start is
+#     gone, so no tolerance code is compiled or run at all.
+#  Clustering outputs are bit-identical to before (checked locally on both schemes).
+#
+# GATES (before any timing): float64 on the GPU, the precision-isolation test the earlier H200
+# jobs ran, and gate_jax_compile_in_clock.py -- which listens for JAX compile events and fails
+# if ANY fires inside a timed start, across cells on both sides of the old n = 100 boundary, and
+# (random_partition) checks the certified run starts from the supplied partition.
+#
+# Grid, datasets, initialisations and hardware are UNCHANGED from the runs being replaced:
+# 13,500 cells (3 d x 15 N x 3 K x 100 datasets), 50 inits, grid batch fractions only
+# (--grid-only), no epoch-2, H200 float64, KMEANS_CERT_MAX_ITERS=1000. dataset_seed / init_seed /
+# mb_seed take no scheme or implementation argument, so these are the same datasets, starting
+# centroids / partitions and batch draws as every other arm.
+#
+# NEW FILE NAMES -- nothing earlier is touched: bestof_jaxtime_{rc,rp}_part_<arrayjob>_<k>.csv,
+# archived to jaxtime_{rc,rp}_<arrayjob>/, log bestof-jaxtime-h200-<arrayjob>_<task>.out.
+#
+# RESUME TRAPS (both hit before).
+#  1. --resume keys on (impl, d, N, K, dataset_id) with NO init_scheme, so each task's glob sees
+#     ONLY its own scheme's files. Never widen it: if it can see the other scheme's files, or any
+#     earlier jax_mb_cert file (bestof_h200_f64*, bestof_rpart_gpu_part_*), every cell looks done
+#     and the task exits having computed nothing.
+#  2. Sharding is `i % num_shards` on the FULL task list (shard == dataset_id % G for G GPUs). To
+#     resubmit one scheme, e.g. `sbatch --array=1 minibatch_hartigan_tests/experiments/jobs/run_bestof_jaxtime_h200.job`,
+#     first count the remaining cells per (dataset_id % G) for the G you will request, or use
+#     --gpus=1 -- an idle GPU is cancelled by YCRC after 2 h.
+#
+#   sbatch minibatch_hartigan_tests/experiments/jobs/run_bestof_jaxtime_h200.job
+# Submit from the repository root. Re-submittable: --resume skips completed cells.
+set -e
+set -o pipefail
+REPO="${REPO:-$HOME/kmeans-paper-repo}"          # ---- EDIT if the repository lives elsewhere ----
+MB="$REPO/minibatch_hartigan_tests"; EXP="$MB/experiments"
+cd "$REPO"
+
+case "$SLURM_ARRAY_TASK_ID" in
+    0) SCHEME=random_centroid;  TAG=rc ;;
+    1) SCHEME=random_partition; TAG=rp ;;
+    *) echo "ERROR: unexpected array task '$SLURM_ARRAY_TASK_ID'"; exit 1 ;;
+esac
+OUT="$MB/results/data/$SCHEME"; mkdir -p "$OUT"
+echo "JOB=$SLURM_ARRAY_JOB_ID TASK=$SLURM_ARRAY_TASK_ID SCHEME=$SCHEME"; echo "NODE=$(hostname)"
+lscpu | grep -m1 "Model name" || true
+nvidia-smi --query-gpu=name,memory.total,compute_cap,driver_version --format=csv || true
+NGPU=$(nvidia-smi --list-gpus | wc -l); echo "visible GPUs: $NGPU"
+
+module load miniconda
+source "$(conda info --base)/etc/profile.d/conda.sh"
+conda activate kmeans-jax-gpu
+export OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1 \
+       VECLIB_MAXIMUM_THREADS=1 NUMEXPR_NUM_THREADS=1 NUMBA_NUM_THREADS=1
+export XLA_PYTHON_CLIENT_MEM_FRACTION=0.7
+export JAX_ENABLE_X64=1                     # the float64 arm -- asserted by the gate
+export KMEANS_CERT_MAX_ITERS=1000           # pinned; lands in every row's cert_budget
+export JAX_COMPILATION_CACHE_DIR="$HOME/.jax_cache"   # a symlink into scratch since 2026-09-12
+unset XLA_FLAGS
+unset KMEANS_SMOKE                          # sbatch exports the submitting shell; never the tiny grid
+cd "$REPO"
+
+# ---- GATES ---------------------------------------------------------------------------------
+# JAX_PLATFORMS=cuda on the gate and on every shard (NOT job-wide: the precision test's workers
+# pin themselves to the CPU via setdefault): if CUDA fails to initialise in a process, JAX
+# raises instead of silently falling back to the CPU and timing there under the 'gpu' label.
+CUDA_VISIBLE_DEVICES=0 JAX_PLATFORMS=cuda python "$EXP/tests/gate_jax_compile_in_clock.py" "$SCHEME"
+python "$EXP/tests/test_fp64_precision_isolation.py"
+
+# ---- archive-on-exit ----------------------------------------------------------------------
+PREFIX="$OUT/bestof_jaxtime_${TAG}_part"
+RUN_DIR="$MB/results/logs/jaxtime_${TAG}_${SLURM_ARRAY_JOB_ID}"; mkdir -p "$RUN_DIR"
+NSHARD=$NGPU
+[ "$NSHARD" -ge 1 ] || { echo "ERROR: no GPU visible"; exit 1; }
+archive() {
+    for k in $(seq 0 $((NSHARD-1))); do
+        cp "${PREFIX}_${SLURM_ARRAY_JOB_ID}_${k}.csv" "$RUN_DIR"/ 2>/dev/null || true
+    done
+    echo "archived parts -> $RUN_DIR"
+}
+trap archive EXIT TERM
+
+# ---- run: one shard per GPU ----------------------------------------------------------------
+echo; echo "=== jax_mb_cert, FLOAT64, $SCHEME, compile-free clock, $NSHARD shards ==="
+set +e                                     # one shard dying must not kill the others
+for k in $(seq 0 $((NSHARD-1))); do
+    PART="${PREFIX}_${SLURM_ARRAY_JOB_ID}_${k}.csv"
+    CUDA_VISIBLE_DEVICES=$k JAX_PLATFORMS=cuda python "$EXP/bestof_init_benchmark.py" \
+        --backend-group gpu --init-scheme "$SCHEME" --workers 1 \
+        --impls jax_mb_cert --grid-only --no-epoch2 \
+        --shard "$k" --num-shards "$NSHARD" \
+        --resume "${PREFIX}_*.csv" \
+        --csv "$PART" > "$RUN_DIR/shard_${k}.log" 2>&1 &
+    echo "launched shard $k on GPU $k (pid $!) -> $PART"
+done
+wait
+archive
+
+echo
+echo "DONE -- jax_mb_cert, float64, $SCHEME, H200, $NSHARD shards."
+echo "Slurm reports COMPLETED even if every shard died: check each $RUN_DIR/shard_*.log for a"
+echo "final 'DONE' (or 'nothing to do' on a fully resumed shard) before believing it."
+echo
+echo "EXPECTED SHAPE when complete: 13,500 cells, 50,400 rows (grid fractions; fewer per cell"
+echo "where ceil(p*N) >= N-K)."
+echo
+echo "MERGE each scheme into its OWN table:"
+echo "  python $EXP/merge_bestof_csv.py $OUT/bestof_jaxtime_${TAG}_f64.csv \\"
+echo "    $OUT/bestof_jaxtime_${TAG}_part_*.csv"

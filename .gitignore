@@ -1,0 +1,15 @@
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+.DS_Store
+
+# Fortran build products (make lib / lib-fp / lib-ref)
+minibatch_hartigan_tests/experiments/fortran/*.so
+minibatch_hartigan_tests/experiments/fortran/*.o
+minibatch_hartigan_tests/experiments/fortran/fp_as136_dp.f
+minibatch_hartigan_tests/experiments/fortran/fp_as136_sp.f
+
+# Fresh experiment outputs. The shipped data are the *.csv.gz files; new runs write plain .csv.
+*.csv
+/*.out
+minibatch_hartigan_tests/results/logs/

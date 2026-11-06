@@ -1,0 +1,154 @@
+#!/bin/bash
+#SBATCH --job-name=bestof-rpart-lloyd
+#SBATCH --partition=gpu
+#SBATCH --constraint=gpu:rtx_5000_ada
+#SBATCH --nodes=1
+#SBATCH --gpus=4
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=8
+#SBATCH --mem=96G
+#SBATCH --time=24:00:00
+#SBATCH --signal=B:TERM@300
+#SBATCH --output=bestof-rpart-lloyd-%j.out
+
+# RANDOM-PARTITION best-of-N benchmark, LLOYD ONLY (`jax_lloyd`, FLOAT64).
+# Completes the random-partition arm: numba_online_ls / numba_mb_cert (job 26508322) and
+# jax_mb_cert (job 26508324) already ran under random_partition; Lloyd ran under random_centroid
+# only (job 23611965, run_bestof_lloyd.job). Nothing else is recomputed: `--impls jax_lloyd`.
+#
+# SAME GRID, DATASETS AND STARTING PARTITIONS AS EVERY OTHER IMPL. Full grid, 13,500 cells
+# (3 d x 15 N x 3 K x 100 datasets), 50 inits. dataset_seed() and init_seed() take no impl or
+# scheme argument, and the partition comes from the same select_init_partition(scheme, data, K,
+# i_seed) call the other three impls made, so (dataset, init) -> identical integer labels.
+#
+# HOW THE PARTITION ENTERS. run_lloyd_kmeans(init_labels=): the first centroids are the
+# partition's block means and the first iteration reassigns every point to the nearest of them.
+# That is Lloyd's own step from a grouping, so the partition is used rather than discarded, and
+# no extra assignment runs before it. n_iters counts that first reassignment.
+#
+# CARD: the RTX 5000 Ada, same header as run_bestof_lloyd.job. Each random-partition arm runs
+# on the hardware its random-centroid counterpart ran on (jax_mb_cert -> H200, as there), so
+# random_partition vs random_centroid Lloyd is compared on one card. Quality is card-independent
+# at float64; as with job 23611965, conv_mean_s is an Ada number and must NOT be placed beside
+# the H200 mini-batch timings (TESTS.md 4b). singleit/epoch2 are NaN by construction.
+#
+# RESUME TRAP. `--resume` keys on (impl, d, N, K, dataset_id) with NO init_scheme. The glob below
+# sees only this job's own bestof_rpart_lloyd_part_* files. Never widen it to bestof_lloyd_part_*
+# (random_centroid Lloyd): every cell would look done and the job would exit having computed
+# nothing. Sharding is `i % num_shards` on the FULL task list (shard == dataset_id % G for G
+# GPUs). On a re-submission, count the remaining cells per (dataset_id % G) for the G you are
+# about to request, or simply use --gpus=1: with leftovers only on old shards {1,3}, --gpus=2
+# puts every cell on one GPU and leaves the other idle into YCRC's 2 h unused-GPU cancellation.
+#
+#   sbatch minibatch_hartigan_tests/experiments/jobs/run_bestof_rpart_lloyd.job
+# Submit from the repository root. Re-submittable: --resume skips completed cells.
+set -e
+set -o pipefail
+REPO="${REPO:-$HOME/kmeans-paper-repo}"          # ---- EDIT if the repository lives elsewhere ----
+MB="$REPO/minibatch_hartigan_tests"; EXP="$MB/experiments"; OUT="$MB/results/data/random_partition"
+mkdir -p "$OUT"
+cd "$REPO"
+
+echo "JOB=$SLURM_JOB_ID"; echo "NODE=$(hostname)"
+lscpu | grep -m1 "Model name" || true
+nvidia-smi --query-gpu=name,memory.total,compute_cap,driver_version --format=csv || true
+NGPU=$(nvidia-smi --list-gpus | wc -l); echo "visible GPUs: $NGPU"
+
+module load miniconda
+source "$(conda info --base)/etc/profile.d/conda.sh"
+conda activate kmeans-jax-gpu
+export OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1 \
+       VECLIB_MAXIMUM_THREADS=1 NUMEXPR_NUM_THREADS=1 NUMBA_NUM_THREADS=1
+export XLA_PYTHON_CLIENT_MEM_FRACTION=0.7
+export JAX_ENABLE_X64=1                     # the float64 arm -- asserted below
+export JAX_COMPILATION_CACHE_DIR="$HOME/.jax_cache"   # a symlink into scratch since 2026-09-12
+unset XLA_FLAGS
+unset KMEANS_SMOKE                          # sbatch exports the submitting shell; never the tiny grid
+cd "$REPO"
+
+# ---- GATE: float64 on the GPU, and Lloyd starts from the supplied partition ----------------
+# Lloyd from a partition must equal Lloyd from that partition's block means with one more
+# iteration counted (the first reassignment), or -- when the random partition is already
+# Lloyd-stable -- return the partition itself after one iteration. Then the runner must
+# reproduce a direct partition-entry call made with the study's own seeds.
+CUDA_VISIBLE_DEVICES=0 python -c "
+import sys, numpy as np, jax, jax.numpy as jnp
+sys.path.insert(0, '$EXP')
+assert jax.default_backend()=='gpu', jax.default_backend()
+assert jax.config.read('jax_enable_x64'), 'JAX_ENABLE_X64=1 did not take effect'
+assert jnp.asarray([1.0]).dtype == jnp.float64, jnp.asarray([1.0]).dtype
+import bestof_init_benchmark as B
+from init_schemes import select_init_centroids, select_init_partition, ASSIGNMENT_SCHEMES
+from _lloyd import run_lloyd_kmeans
+from _common_functions_for_minibatch import compute_centroids
+assert 'random_partition' in ASSIGNMENT_SCHEMES
+try:
+    select_init_centroids('random_partition', np.zeros((10,3)), 2, 0)
+    raise SystemExit('FAIL: select_init_centroids served a partition-defined scheme')
+except ValueError:
+    pass
+for d, n, K in ((100, 565, 4), (1000, 565, 16), (10000, 565, 16), (100, 10000, 8)):
+    data, tl = B.generate_dataset(n, d, K, B.dataset_seed(d, n, K, 0))
+    dj = jnp.asarray(data)
+    for init_id in range(3):
+        i_seed = B.init_seed(d, n, K, 0, init_id)
+        p = select_init_partition('random_partition', data, K, i_seed)
+        pops = np.bincount(p, minlength=K)
+        assert pops.min() >= 1 and pops.max() - pops.min() <= 1, pops
+        lj = jnp.asarray(p)
+        _c1, l1, _o1, it1 = run_lloyd_kmeans(dj, jnp.zeros((K, d)), B.MAX_ITERS, init_labels=lj)
+        _c0, l0, _o0, it0 = run_lloyd_kmeans(dj, compute_centroids(dj, lj, K), B.MAX_ITERS)
+        l1, l0, it1, it0 = np.asarray(l1), np.asarray(l0), int(it1), int(it0)
+        stable = it1 == 1 and np.array_equal(l1, p)
+        assert np.array_equal(l1, l0) and (it1 == it0 + 1 or (stable and it0 == 1)), \
+            f'Lloyd did NOT start from the supplied partition at {(d, n, K, init_id)}: {it1} vs {it0}'
+        prep = {'data': data, 'true_labels': tl, 'dj': dj}
+        r = B.run_jax_lloyd('random_partition', prep, K, i_seed, -1.0, 0, -1)
+        assert r['n_iters'] == it1 and r['nmi'] == B.nmi_score(tl, l1), \
+            f'runner disagrees with a direct partition-entry call at {(d, n, K, init_id)}'
+    print(f'  d={d:5d} n={n:6d} K={K:3d}: sizes {pops.min()}-{pops.max()}, '
+          f'Lloyd starts from the supplied partition, runner agrees')
+print('float64 on GPU confirmed:', jnp.asarray([1.0]).dtype, jax.devices())
+print('PARTITION-ENTRY GATE PASSED')"
+
+# ---- archive-on-exit ----------------------------------------------------------------------
+RUN_DIR="$MB/results/logs/rpart_lloyd_${SLURM_JOB_ID}"; mkdir -p "$RUN_DIR"
+NSHARD=$NGPU
+[ "$NSHARD" -ge 1 ] || { echo "ERROR: no GPU visible"; exit 1; }
+archive() {
+    for k in $(seq 0 $((NSHARD-1))); do
+        cp "$OUT/bestof_rpart_lloyd_part_${SLURM_JOB_ID}_${k}.csv" \
+           "$RUN_DIR"/ 2>/dev/null || true
+    done
+    echo "archived parts -> $RUN_DIR"
+}
+trap archive EXIT TERM
+
+# ---- run: one shard per GPU ----------------------------------------------------------------
+echo; echo "=== jax_lloyd, FLOAT64, random_partition (partition entry), $NSHARD shards ==="
+set +e                                     # one shard dying must not kill the others
+for k in $(seq 0 $((NSHARD-1))); do
+    PART="$OUT/bestof_rpart_lloyd_part_${SLURM_JOB_ID}_${k}.csv"
+    CUDA_VISIBLE_DEVICES=$k python "$EXP/bestof_init_benchmark.py" \
+        --backend-group gpu --init-scheme random_partition --workers 1 \
+        --impls jax_lloyd --no-epoch2 \
+        --shard "$k" --num-shards "$NSHARD" \
+        --resume "$OUT/bestof_rpart_lloyd_part_*.csv" \
+        --csv "$PART" > "$RUN_DIR/shard_${k}.log" 2>&1 &
+    echo "launched shard $k on GPU $k (pid $!) -> $PART"
+done
+wait
+archive
+
+echo
+echo "DONE — jax_lloyd, float64, random_partition, $NSHARD shards."
+echo "Slurm will report COMPLETED even if every shard died: check each"
+echo "  $RUN_DIR/shard_*.log  for a final 'DONE' line before believing it."
+echo
+echo "EXPECTED SHAPE when complete: 13,500 rows, one per cell (proportion = -1)."
+echo
+echo "MERGE into its OWN table:"
+echo "  python $EXP/merge_bestof_csv.py $OUT/bestof_rpart_lloyd_f64.csv \\"
+echo "    $OUT/bestof_rpart_lloyd_part_*.csv"
+echo
+echo "USE FOR QUALITY, and for runtime only against the random_centroid Lloyd (same Ada card)."

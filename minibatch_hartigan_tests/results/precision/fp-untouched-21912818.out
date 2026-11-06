@@ -1,0 +1,61 @@
+loaded module: GCC
+NODE=[compute node name redacted]
+Model name:                              AMD EPYC 9655 96-Core Processor
+GNU Fortran (GCC) 13.3.0
+as136.f  md5: 65128ab861af399bfe20e91b78ae2839  lines: 894
+git status of as136.f:
+  (not a git checkout here)
+gfortran -O3 -std=legacy -ffixed-form -w -fPIC -shared as136.f hartigan_fortran_ext.f -o libas136_ref64.so
+gfortran -O3 -std=legacy -ffixed-form -w -freal-8-real-4 -fPIC -shared as136.f hartigan_fortran_ext.f -o libas136_ref32.so
+-rwxr-xr-x 1 [user] [group] 25144 Aug 10 20:30 libas136_ref32.so
+-rwxr-xr-x 1 [user] [group] 25144 Aug 10 20:30 libas136_ref64.so
+ref64 md5: 211425b2bb913163f26fbc22f3c42d45
+ref32 md5: 97a1923b7fa00f5a638bc771ee616612
+
+============================================================================
+uselive=0 (no live-set guard; what the sweep used)
+============================================================================
+     d      N   K trial | f64 iters ifault | f32 iters ifault | verdict
+-- CYCLED in the sweep --------------------------------------------------
+ 10000    350   4    53 |         2      0 |     10000      2 | NON-TERMINATING
+ 10000   5000   4    28 |         2      0 |     10000      2 | NON-TERMINATING
+ 10000   5000   4    40 |         2      0 |     10000      2 | NON-TERMINATING
+ 10000   6500   4    74 |         2      0 |     10000      2 | NON-TERMINATING
+ 10000   3838   8    97 |         3      0 |     10000      2 | NON-TERMINATING
+ 10000   6500   8    64 |         2      0 |     10000      2 | NON-TERMINATING
+ 10000   8000   8    72 |         2      0 |     10000      2 | NON-TERMINATING
+ 10000  10000   8    37 |         3      0 |     10000      2 | NON-TERMINATING
+ 10000   6500  16    65 |         3      0 |     10000      2 | NON-TERMINATING
+ 10000  10000  16    98 |         4      0 |     10000      2 | NON-TERMINATING
+-- control --------------------------------------------------
+ 10000     32   4     0 |         2      0 |         2      0 | terminated
+ 10000     32   4     1 |         1      0 |         1      0 | terminated
+ 10000     32   4     3 |         2      0 |         2      0 | terminated
+
+  10/10 of the sweep's cycling cases reproduce with the UNTOUCHED as136.f at uselive=0
+
+============================================================================
+uselive=1 (original AS-136 live-set path)
+============================================================================
+     d      N   K trial | f64 iters ifault | f32 iters ifault | verdict
+-- CYCLED in the sweep --------------------------------------------------
+ 10000    350   4    53 |         2      0 |     10000      2 | NON-TERMINATING
+ 10000   5000   4    28 |         2      0 |     10000      2 | NON-TERMINATING
+ 10000   5000   4    40 |         2      0 |     10000      2 | NON-TERMINATING
+ 10000   6500   4    74 |         2      0 |     10000      2 | NON-TERMINATING
+ 10000   3838   8    97 |         3      0 |     10000      2 | NON-TERMINATING
+ 10000   6500   8    64 |         2      0 |     10000      2 | NON-TERMINATING
+ 10000   8000   8    72 |         2      0 |     10000      2 | NON-TERMINATING
+ 10000  10000   8    37 |         3      0 |     10000      2 | NON-TERMINATING
+ 10000   6500  16    65 |         3      0 |     10000      2 | NON-TERMINATING
+ 10000  10000  16    98 |         4      0 |     10000      2 | NON-TERMINATING
+-- control --------------------------------------------------
+ 10000     32   4     0 |         2      0 |         2      0 | terminated
+ 10000     32   4     1 |         1      0 |         1      0 | terminated
+ 10000     32   4     3 |         2      0 |         2      0 | terminated
+
+  10/10 of the sweep's cycling cases reproduce with the UNTOUCHED as136.f at uselive=1
+
+DONE. If the 10 cases show f32 iters=10000 / ifault=2 while f64 shows 2-4 / ifault=0,
+the non-termination is a property of AS-136 at float32 and nothing in
+gen_fp_variants.py, the _dp/_sp rename, or the trace instrumentation is involved.

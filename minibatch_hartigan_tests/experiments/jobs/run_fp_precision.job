@@ -1,0 +1,123 @@
+#!/bin/bash
+#SBATCH --job-name=fp-precision
+#SBATCH --partition=day
+# Pinned for consistency with every other CPU row even though this experiment does not
+# depend on it: the question is which DECISIONS the two variants make, which is a property
+# of the arithmetic, not the machine. The timing columns are incidental.
+#SBATCH --constraint=cpumodel:9655
+#SBATCH --cpus-per-task=32
+# peak ~2 GB/worker at d=10000,N=10000 (float64 data + Fortran-order copy + float32 copy)
+# plus the 32 MB trace buffer per process.
+#SBATCH --mem=192G
+# 6h for a ~12-minute job. The d=10000 large-N tail is extrapolated from cells that have not
+# been measured yet, so the estimate could be off by a lot in the wrong direction — and every
+# other job in this study so far has died on its wall clock. Slack is free here.
+#SBATCH --time=06:00:00
+#SBATCH --signal=B:TERM@120
+#SBATCH --output=fp-precision-%j.out
+
+# DOES FLOAT32 CHANGE HARTIGAN'S DECISIONS, OR ONLY ITS ROUNDING?
+#
+# Mini-batch Hartigan in float32 fails to certify convergence on 28 grid cells / 114 inits
+# where float64 fails on none. Two possible readings: an artefact of the mini-batch drivers,
+# or the algorithm itself failing to reach a fixed point at float32. ONLINE Hartigan settles
+# it — AS-136 is the original, deterministic given (data, init), with no sampling, no
+# tolerance and no early stop to confound the answer.
+#
+# WHAT RUNS. Two builds of AS-136 that are provably the same program at two widths: both are
+# GENERATED from as136.f by gen_fp_variants.py, and `make fp-audit` inverts the precision
+# transform and requires a byte-exact match. Production libas136.so is untouched.
+#
+# Both variants get the SAME datasets and the SAME initial centres, from the study's own
+# `dataset_seed` / `init_seed` — the seeds are written into every output row. Every committed
+# transfer is recorded as (stage, point, from, to), so the two runs are compared decision by
+# decision, and the first index at which they disagree is reported with both sides' records.
+#
+# THE VERDICT COLUMN is `fp_movers_sp_exact`: how many points would still move out of the
+# float32 run's partition, evaluated IN FLOAT64 under Hartigan's own criterion.
+#     0 everywhere -> float32 reaches genuine fixed points; the mini-batch failures are
+#                     implementation-level.
+#     > 0 anywhere -> float32 stops short of a fixed point in the ORIGINAL algorithm, which
+#                     is fundamental rather than a driver bug.
+#
+# The live-set guard is OFF (--uselive 0). It is an optimisation that lets OPTRA skip
+# clusters, and it is already known to stop short of a true fixed point sometimes; leaving it
+# on would give any non-fixed-point result a second possible explanation.
+#
+# Grid: the big test's own regimes — d {100,1000,10000} x N (15 values) x K {4,8,16} = 135
+# regimes x 100 trials = 13,500 pairs. Estimated ~6 core-hours, i.e. ~12 minutes on 32
+# workers. 100 rather than 10 trials because the run is cheap and the question is not only
+# WHETHER float32 diverges but HOW OFTEN — at 10 trials a 1-in-50 effect is invisible.
+#   sbatch minibatch_hartigan_tests/experiments/jobs/run_fp_precision.job
+# Submit from the repository root.
+set -e
+REPO="${REPO:-$HOME/kmeans-paper-repo}"          # ---- EDIT if the repository lives elsewhere ----
+cd "$REPO/minibatch_hartigan_tests/experiments/fortran"
+
+# ---------------- 1. gfortran ---------------------------------------------------------
+if ! command -v gfortran >/dev/null 2>&1; then
+    for m in GCC gcc foss/2022b gompi/2022b; do
+        module load "$m" 2>/dev/null && command -v gfortran >/dev/null 2>&1 && \
+            { echo "loaded module: $m"; break; }
+    done
+fi
+command -v gfortran >/dev/null 2>&1 || { echo "ERROR: gfortran not found"; exit 1; }
+echo "NODE=$(hostname)"; lscpu | grep -m1 "Model name"; gfortran --version | head -1
+
+# ---------------- 2. python env -------------------------------------------------------
+module load miniconda
+source "$(conda info --base)/etc/profile.d/conda.sh"
+conda activate kmeans-jax-gpu
+export OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1 \
+       VECLIB_MAXIMUM_THREADS=1 NUMEXPR_NUM_THREADS=1 NUMBA_NUM_THREADS=1
+export JAX_PLATFORMS=cpu
+
+# ---------------- 3. generate + build + AUDIT (the gate) ------------------------------
+# The audit is fail-fast on purpose: if the two variants are not the same program, every
+# number this job produces is meaningless.
+python gen_fp_variants.py
+make fp-audit
+make lib-fp
+ls -la libfp136.so
+
+# ---------------- 4. sanity gate: float64 must reach a fixed point --------------------
+# If the float64 arm does not land on fp_movers == 0, the harness is wrong and the float32
+# result cannot be interpreted. Cheap, and it fails before the sweep rather than after.
+python - <<'PY'
+import os, sys
+sys.path.insert(0, "."); sys.path.insert(0, "..")
+sys.path.insert(0, os.path.join("..", "..", "..", "batch_hartigan_tests", "experiments"))
+import numpy as np, bestof_init_benchmark as B
+from init_schemes import select_init_centroids
+from fp_hartigan_ctypes import run_kmns_dp, run_kmns_sp
+d, n, K = 100, 217, 4
+data, _ = B.generate_dataset(n, d, K, B.dataset_seed(d, n, K, 0))
+init = select_init_centroids("random_centroid", data, K, B.init_seed(d, n, K, 0, 0))
+r64 = run_kmns_dp(data, init, uselive=0)
+r32 = run_kmns_sp(data, init, uselive=0)
+mv = B._fp_movers(data, r64["centroids"], r64["labels"], K)
+print(f"gate: float64 n_iters={r64['n_iters']} ifault={r64['ifault']} "
+      f"transfers={len(r64['trace'])} fp_movers={mv}")
+print(f"gate: float32 n_iters={r32['n_iters']} ifault={r32['ifault']} "
+      f"transfers={len(r32['trace'])}")
+assert r64["ifault"] == 0, f"float64 did not converge (ifault={r64['ifault']})"
+assert mv == 0, f"float64 did NOT reach a fixed point (fp_movers={mv}) — harness is wrong"
+assert len(r64["trace"]) > 0, "no transfers recorded — trace instrumentation is dead"
+print("gate OK")
+PY
+
+# ---------------- 5. the sweep --------------------------------------------------------
+cd "$REPO"
+mkdir -p "$REPO/minibatch_hartigan_tests/results/precision"
+OUT="$REPO/minibatch_hartigan_tests/results/precision/fp_precision_${SLURM_JOB_ID}.csv"
+python minibatch_hartigan_tests/experiments/fortran/fp_precision_compare.py \
+    --trials 100 --workers "${SLURM_CPUS_PER_TASK:-32}" --uselive 0 --max-iters 10000 \
+    --csv "$OUT"
+
+echo
+echo "DONE — $OUT"
+echo "Read the VERDICT block above. Then, per regime:"
+echo "  fp_movers_sp_exact > 0  ->  float32 does NOT reach true fixed points (fundamental)"
+echo "  trace_identical == 0    ->  the two precisions made different DECISIONS; the row's"
+echo "                              first_divergence / div_* columns say exactly where, and"
+echo "                              dataset_seed / init_seed reproduce that run exactly."

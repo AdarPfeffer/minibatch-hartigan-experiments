@@ -1,0 +1,136 @@
+#!/bin/bash
+#SBATCH --job-name=bestof-rpart-cpu
+#SBATCH --partition=day
+#SBATCH --cpus-per-task=64
+#SBATCH --mem=192G
+#SBATCH --time=24:00:00
+#SBATCH --output=bestof-rpart-cpu-%j.out
+
+# RANDOM-PARTITION best-of-N benchmark, CPU half — CORRECTED SCHEME (2026-09-16).
+# Impls: numba_online_ls, numba_mb_cert. float64. Companion: run_bestof_rpart_gpu.job.
+#
+# *** WHAT CHANGED, AND WHY THE EARLIER bestof_rp_* FILES ARE SUPERSEDED. ***
+# Hartigan's criterion weights every distance by cluster size -- stay costs n/(n-1), move costs
+# n/(n+1) -- so it cannot be evaluated until a grouping exists. An algorithm handed only
+# CENTROIDS therefore has to manufacture one first, with a single UNWEIGHTED nearest-centroid
+# pass. That pass is unavoidable for random_centroid (K data points are not a grouping) and it
+# is what AS-136's KMNS does in its first loop before it can set AN1/AN2.
+#
+# For random_partition it is NOT needed: the grouping and its sizes are given. Running it
+# anyway DISCARDS the specified partition and replaces it with the nearest-centroid cells of K
+# block means -- and because every block mean is the mean of a random 1/K sample, they all sit
+# within a hair of the global mean, so those cells are near-arbitrary. Measured: the recovered
+# grouping agrees with the specified one AT CHANCE (17-26% at K=4..16).
+#
+# So the earlier arm did not measure random-partition initialisation. It measured "the Voronoi
+# cells of K nearly-coincident centroids", which is a different and worse initialiser that
+# happens to be reachable from one. This job measures the real thing: the partition enters via
+# each algorithm's `init_labels=` parameter and the first thing that touches it is a Hartigan
+# pass. `select_init_centroids` now RAISES for partition-defined schemes so the old route
+# cannot be taken by accident (init_schemes.ASSIGNMENT_SCHEMES).
+#
+# *** NO FORTRAN IN THIS ARM, AND THAT IS NOT AN OVERSIGHT. ***
+# AS-136 cannot accept a starting partition: KMNS writes `ic1(i) = 1` for every point before it
+# reads anything (as136.f:142), so an incoming grouping is destroyed in its first statement.
+# The only ways in would be to modify the published Fortran -- which would cost us the
+# unmodified-reference-implementation baseline that gives it its value -- or to accept the
+# spurious pass, which is the thing being removed. fortran_ls / fortran_nols therefore appear
+# in the random_centroid tables only. Decision recorded 2026-09-16.
+#
+# Grid, datasets and hardware are otherwise UNCHANGED from study 1.4's CPU half: 13,500 cells
+# (3 d x 15 N x 3 K x 100 datasets), 50 inits, partition=day / 64 cores / 192 GB. `dataset_seed`
+# does not depend on the init scheme, so this clusters the byte-identical datasets the
+# random-centroid sweep used -- the comparison is per dataset, not merely distributional. The
+# partition itself comes from the same `default_rng(seed).permutation(n)` the superseded arm
+# drew, so a cell's partition here is the one whose block means that arm averaged.
+#
+# `--grid-only` (4 grid proportions, no p_max) and `--no-epoch2` match the 1.11 float64 arm.
+# epoch-2 replays from CENTROIDS by construction and is not defined for a partition scheme, so
+# it is NaN here regardless; --no-epoch2 makes that explicit.
+#
+# *** RESUME TRAP. *** `--resume` keys on (impl, d, N, K, dataset_id) with NO `init_scheme`, so
+# a glob that can see ANY other scheme's CSV makes this job conclude everything is done and
+# exit having computed nothing. Scoped to its own `bestof_rpart_cpu_*` files. DO NOT widen it,
+# and never point it at bestof_cpu_full.csv or the superseded bestof_rp_cpu_*.csv.
+#
+#   sbatch minibatch_hartigan_tests/experiments/jobs/run_bestof_rpart_cpu.job
+# Submit from the repository root. Re-submittable: --resume skips completed cells.
+set -e
+set -o pipefail
+REPO="${REPO:-$HOME/kmeans-paper-repo}"          # ---- EDIT if the repository lives elsewhere ----
+MB="$REPO/minibatch_hartigan_tests"; EXP="$MB/experiments"; OUT="$MB/results/data/random_partition"
+mkdir -p "$OUT"
+cd "$REPO"
+
+echo "JOB=$SLURM_JOB_ID"; echo "NODE=$(hostname)"
+lscpu | grep -m1 "Model name" || true
+echo "cpus-per-task=$SLURM_CPUS_PER_TASK"
+
+module load miniconda
+source "$(conda info --base)/etc/profile.d/conda.sh"
+conda activate kmeans-jax-gpu
+
+# No Fortran build: AS-136 is not in this arm (see above). bestof_init_benchmark imports the
+# ctypes wrapper at module scope, which does not require the .so until a fortran impl runs.
+export OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1 \
+       VECLIB_MAXIMUM_THREADS=1 NUMEXPR_NUM_THREADS=1 NUMBA_NUM_THREADS=1
+export KMEANS_CERT_MAX_ITERS=1000
+cd "$REPO"
+
+# ---- GATE: the partition must actually be what the algorithm starts from. ----------------
+# With max_iters=0 no sweeps run, so the labels that come back ARE the starting grouping.
+python -c "
+import sys, numpy as np
+sys.path.insert(0, '$EXP')
+from init_schemes import select_init_centroids, select_init_partition, ASSIGNMENT_SCHEMES
+from streamed_hartigan import run_hartigan_kmeans_ls_timed
+assert 'random_partition' in ASSIGNMENT_SCHEMES
+try:
+    select_init_centroids('random_partition', np.zeros((10,3)), 2, 0)
+    raise SystemExit('FAIL: select_init_centroids served a partition-defined scheme')
+except ValueError:
+    pass
+rng = np.random.default_rng(0)
+for n, d, K in ((600, 40, 6), (565, 1000, 16), (10000, 100, 4)):
+    X = np.ascontiguousarray(rng.normal(size=(n, d)))
+    p = select_init_partition('random_partition', X, K, 4242)
+    pops = np.bincount(p, minlength=K)
+    assert pops.min() >= 1 and pops.max() - pops.min() <= 1, pops
+    _c, l, _lo, _it, _pi = run_hartigan_kmeans_ls_timed(
+        X, np.zeros((K, d)), 0, init_labels=p)
+    assert np.array_equal(l, p), 'algorithm did NOT start from the supplied partition'
+    print(f'  n={n:6d} d={d:5d} K={K:3d}: sizes {pops.min()}-{pops.max()}, '
+          f'algorithm starts from the supplied partition')
+print('PARTITION-ENTRY GATE PASSED')"
+
+# ---- archive-on-exit ----------------------------------------------------------------------
+RUN_DIR="$MB/results/logs/rpart_cpu_${SLURM_JOB_ID}"; mkdir -p "$RUN_DIR"
+CSV="$OUT/bestof_rpart_cpu_${SLURM_JOB_ID}.csv"
+archive() { cp "$CSV" "$RUN_DIR"/ 2>/dev/null || true; echo "archived -> $RUN_DIR"; }
+trap archive EXIT TERM
+
+# ---- run -----------------------------------------------------------------------------------
+WORKERS="${WORKERS:-${SLURM_CPUS_PER_TASK:-64}}"
+echo; echo "=== numba online + mb_cert, FLOAT64, random_partition (partition entry), $WORKERS workers ==="
+python "$EXP/bestof_init_benchmark.py" \
+    --backend-group cpu --init-scheme random_partition \
+    --impls numba_online_ls,numba_mb_cert \
+    --grid-only --no-epoch2 --workers "$WORKERS" \
+    --resume "$OUT/bestof_rpart_cpu_*.csv" \
+    --csv "$CSV"
+archive
+
+echo
+echo "DONE — CPU half, float64, random_partition (corrected), $WORKERS workers -> $CSV"
+echo
+echo "EXPECTED SHAPE: 13,500 rows for numba_online_ls (proportion = -1) and ~50,400 for"
+echo "  numba_mb_cert (4 grid proportions, fewer where ceil(p*n) > n-K)."
+echo
+echo "MERGE with the GPU half into its OWN table:"
+echo "  python $EXP/merge_bestof_csv.py $OUT/bestof_rpart_full.csv \\"
+echo "    $OUT/bestof_rpart_cpu_*.csv $OUT/bestof_jaxtime_rp_part_*.csv"
+echo
+echo "!!! NEVER merge with bestof_cpu_full.csv (random_centroid) or with the SUPERSEDED"
+echo "    bestof_rp_*.csv (the bootstrapped scheme). merge_bestof_csv.py's de-dup key DOES"
+echo "    include init_scheme, but both of those are labelled random_partition too -- the"
+echo "    superseded files are distinguished only by name. Quarantine them."

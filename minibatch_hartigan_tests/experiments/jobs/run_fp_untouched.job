@@ -1,0 +1,72 @@
+#!/bin/bash
+#SBATCH --job-name=fp-untouched
+#SBATCH --partition=day
+#SBATCH --constraint=cpumodel:9655
+#SBATCH --cpus-per-task=1
+#SBATCH --mem=64G
+# 10 runs x 10,000 passes at d=10^4 with N up to 10^4, serial, x2 live-set settings.
+# The sweep's slowest single cycling run took ~4.4h on its own; this repeats the worst of
+# them twice, so the wall is sized for that and not for the median.
+#SBATCH --time=24:00:00
+#SBATCH --signal=B:TERM@300
+#SBATCH --output=fp-untouched-%j.out
+
+# CONTROL: does the float32 non-termination survive when NOTHING of mine is in the chain?
+#
+# The cycling result came from fp_as136_{dp,sp}.f, which gen_fp_variants.py derived from
+# as136.f — renamed symbols, one re-wrapped line, two inserted `call fptrc_add`. That
+# derivation passes a byte-exact equivalence audit and two independent re-implementations
+# reproduce the cycle, but all of it still shares my transformation.
+#
+# This compiles the PRODUCTION as136.f twice, unmodified:
+#     libas136_ref64.so   gfortran ... (double precision, as written)
+#     libas136_ref32.so   gfortran ... -freal-8-real-4
+# `-freal-8-real-4` demotes every `double precision` in the source to 4-byte real at compile
+# time. Not one character of as136.f changes. No generator, no rename, no trace, no re-wrap.
+#
+# Then it replays the 10 seeds that never terminated in the sweep, plus 3 that were
+# trace-identical as controls, under BOTH live-set settings — so if the cycle appears at
+# uselive=1 too, the g_uselive modification (which predates this work) is also cleared.
+#
+# Expected if the finding is real: the 10 cycle in float32 (ifault=2, 10000 iterations) and
+# terminate in float64 (2-4 iterations); the 3 controls terminate in both.
+#   sbatch minibatch_hartigan_tests/experiments/jobs/run_fp_untouched.job
+# Submit from the repository root (this job's Slurm log is the result; the shipped copy is
+# minibatch_hartigan_tests/results/precision/fp-untouched-21912818.out).
+set -e
+REPO="${REPO:-$HOME/kmeans-paper-repo}"          # ---- EDIT if the repository lives elsewhere ----
+cd "$REPO/minibatch_hartigan_tests/experiments/fortran"
+
+if ! command -v gfortran >/dev/null 2>&1; then
+    for m in GCC gcc foss/2022b gompi/2022b; do
+        module load "$m" 2>/dev/null && command -v gfortran >/dev/null 2>&1 && \
+            { echo "loaded module: $m"; break; }
+    done
+fi
+command -v gfortran >/dev/null 2>&1 || { echo "ERROR: gfortran not found"; exit 1; }
+echo "NODE=$(hostname)"; lscpu | grep -m1 "Model name"; gfortran --version | head -1
+
+# Prove as136.f is the committed file, unmodified, before building from it.
+echo "as136.f  md5: $(md5sum as136.f | awk '{print $1}')  lines: $(wc -l < as136.f)"
+echo "git status of as136.f:"; (cd "$REPO" && git status --porcelain -- minibatch_hartigan_tests/experiments/fortran/as136.f 2>/dev/null || echo "  (not a git checkout here)")
+
+module load miniconda
+source "$(conda info --base)/etc/profile.d/conda.sh"
+conda activate kmeans-jax-gpu
+export OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1 \
+       VECLIB_MAXIMUM_THREADS=1 NUMEXPR_NUM_THREADS=1 NUMBA_NUM_THREADS=1
+export JAX_PLATFORMS=cpu
+
+make lib-ref
+ls -la libas136_ref64.so libas136_ref32.so
+# Confirm the demotion actually happened: the float32 build must be the smaller/different one.
+echo "ref64 md5: $(md5sum libas136_ref64.so | awk '{print $1}')"
+echo "ref32 md5: $(md5sum libas136_ref32.so | awk '{print $1}')"
+
+cd "$REPO"
+python minibatch_hartigan_tests/experiments/fortran/fp_untouched_check.py
+
+echo
+echo "DONE. If the 10 cases show f32 iters=10000 / ifault=2 while f64 shows 2-4 / ifault=0,"
+echo "the non-termination is a property of AS-136 at float32 and nothing in"
+echo "gen_fp_variants.py, the _dp/_sp rename, or the trace instrumentation is involved."

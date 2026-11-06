@@ -1,0 +1,65 @@
+#!/bin/bash
+#SBATCH --job-name=bestof-cpu
+#SBATCH --partition=day            # ---- EDIT: your CPU partition (e.g. day/week/scavenge) ----
+#SBATCH --cpus-per-task=64
+#SBATCH --mem=192G
+#SBATCH --time=24:00:00
+#SBATCH --output=bestof-cpu-%j.out
+
+# Best-of-N INITIALIZATION benchmark — CPU half (ONE job, ALL dims): numba (online +
+# mb_cert) + fortran (ls + nols). Datasets run in PARALLEL across the 64 cores, but every
+# trial is STRICTLY SINGLE-THREADED (env pinned below; the algorithms never thread within
+# a clustering). Clusters the BYTE-IDENTICAL seeded data the GPU half uses. NO early-stop
+# guards. Submit from the repository root:   sbatch minibatch_hartigan_tests/experiments/jobs/run_bestof_cpu.job
+#
+# Memory note: at d=10000,N=10000 a worker holds ~1.6 GB (row-major + Fortran-order copy);
+# 64 such workers peak ~100 GB, hence --mem=192G. If your node caps lower, drop
+# --cpus-per-task (fewer workers -> lower peak) rather than risk an OOM kill.
+# (DIMS is overridable for a manual split if ever needed, e.g.
+#  sbatch --export=ALL,DIMS=10000 ... — but by default this one job does all three.)
+set -e
+REPO="${REPO:-$HOME/kmeans-paper-repo}"          # ---- EDIT if the repository lives elsewhere ----
+MB="$REPO/minibatch_hartigan_tests"; EXP="$MB/experiments"; OUT="$MB/results/data/random_centroid"
+mkdir -p "$OUT"
+cd "$REPO"
+[ -d "$REPO/batch_hartigan_tests/experiments" ] || { echo "ERROR: $REPO/batch_hartigan_tests/experiments missing (mini_batch needs it)"; exit 1; }
+DIMS="${DIMS:-100,1000,10000}"
+WORKERS="${SLURM_CPUS_PER_TASK:-8}"
+
+# ---------------- 1. build libas136.so (needs gfortran) ------------------------------
+GCC_MODULE=""
+if ! command -v gfortran >/dev/null 2>&1; then
+    for m in GCC gcc foss/2022b gompi/2022b; do
+        if module load "$m" 2>/dev/null && command -v gfortran >/dev/null 2>&1; then
+            GCC_MODULE="$m"; echo "loaded module: $m"; break
+        fi
+    done
+fi
+command -v gfortran >/dev/null 2>&1 || { echo "ERROR: gfortran not found (module avail GCC)"; exit 1; }
+cd "$EXP/fortran"
+make lib
+
+# ---------------- 2. python env + single-thread pinning (RED LINE) -------------------
+module load miniconda
+source "$(conda info --base)/etc/profile.d/conda.sh"
+conda activate kmeans-jax-gpu
+export OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1 \
+       VECLIB_MAXIMUM_THREADS=1 NUMEXPR_NUM_THREADS=1 NUMBA_NUM_THREADS=1
+cd "$REPO"
+
+# ---------------- 3. numba gate (live-set / certified tests) -------------------------
+python "$EXP/tests/test_live_sets.py"
+
+# ---------------- 4. archive-on-exit -------------------------------------------------
+STAMP="$(date +%Y%m%d_%H%M%S)"
+RUN_DIR="$MB/results/logs/bestof_results_${SLURM_JOB_ID:-$STAMP}"
+CSV="$OUT/bestof_cpu.csv"
+archive() { mkdir -p "$RUN_DIR"; cp "$CSV" "$RUN_DIR"/ 2>/dev/null || true; \
+            echo "archived $CSV -> $RUN_DIR"; }
+trap archive EXIT TERM
+
+# ---------------- 5. run: CPU impls, all dims, 64 single-threaded workers ------------
+python "$EXP/bestof_init_benchmark.py" --backend-group cpu \
+    --init-scheme random_centroid --dims "$DIMS" --workers "$WORKERS" --csv "$CSV"
+archive
+echo "DONE — CPU half (dims=$DIMS, workers=$WORKERS) in $CSV"

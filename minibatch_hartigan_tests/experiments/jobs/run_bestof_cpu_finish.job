@@ -1,0 +1,106 @@
+#!/bin/bash
+#SBATCH --job-name=bestof-cpu-finish
+#SBATCH --partition=day            # ---- EDIT: your CPU partition (day/week/scavenge) ----
+# HARDWARE PIN (added 2026-07-30). Trials are strictly single-threaded, so per-core speed sets
+# the timings: pin one CPU model (AMD EPYC 9655).
+#SBATCH --constraint=cpumodel:9655
+# 96 = the 9655's PHYSICAL core count. A larger --cpus-per-task cannot land on this model, and
+# a different model would break the timing pin, so scale by NODES not by node size.
+# 10 shards x 96 = 960 CPUs, inside the 1000-CPU budget the `day` partition allows.
+#SBATCH --array=0-9
+#SBATCH --cpus-per-task=96
+# 96 workers x ~1.6 GB resident at d=10000,N=10000 (float64 data + Fortran-order copy) = ~154 GB.
+#SBATCH --mem=256G
+#SBATCH --time=24:00:00
+# Grace period so the archive trap runs before SIGKILL (no --signal existed before 2026-08-07).
+#SBATCH --signal=B:TERM@600
+#SBATCH --output=bestof-cpu-finish-%A_%a.out
+
+# FINISH the timed-out CPU half of the best-of-N init benchmark: same build/env/impls as
+# run_bestof_cpu.job (numba + fortran, single-threaded workers), but --resume skips the
+# (d,N,K,dataset) cells already complete in the prior part CSVs and writes ONLY the missing
+# cells to a fresh part CSV.
+#
+# REMAINING as of 2026-08-07: 1,762 dataset-cells, ALL at d=10000, N in {2378..10000}.
+#
+# --no-epoch2 (added 2026-08-07). Epoch-2 is R+1 replays of ONE pass, so it costs (R+1)/n_iters
+# times the convergence run beside it — ~68% of a CPU cell. It shares no state with the
+# convergence/single-iter measurements, so it is split into its own job (run_bestof_epoch2.job,
+# R=10) that runs AFTER this one. Convergence + single-iter land first and can be analysed while
+# epoch-2 is still being collected. epoch2_mean_s / epoch2_std_s are written NaN here.
+# Cost with epoch-2 removed and the 1000-pass cap in force: ~28,100 core-hours
+#   => 960 CPUs -> ~29h, i.e. TWO 24h links. The chain below handles that unattended.
+#
+#   sbatch minibatch_hartigan_tests/experiments/jobs/run_bestof_cpu_finish.job
+#   no auto-continue:   sbatch --export=ALL,CHAIN_MAX=1 minibatch_hartigan_tests/experiments/jobs/run_bestof_cpu_finish.job
+#   stop a chain early: scancel -u $USER --name=bestof-cpu-finish
+# Submit from the repository root.
+set -e
+CHAIN="${CHAIN:-1}"; CHAIN_MAX="${CHAIN_MAX:-4}"
+REPO="${REPO:-$HOME/kmeans-paper-repo}"          # ---- EDIT if the repository lives elsewhere ----
+MB="$REPO/minibatch_hartigan_tests"; EXP="$MB/experiments"; OUT="$MB/results/data/random_centroid"
+mkdir -p "$OUT"
+JOBFILE="$EXP/jobs/run_bestof_cpu_finish.job"
+cd "$REPO"
+[ -d "$REPO/batch_hartigan_tests/experiments" ] || { echo "ERROR: $REPO/batch_hartigan_tests/experiments missing (mini_batch needs it)"; exit 1; }
+DIMS="${DIMS:-100,1000,10000}"                   # all dims; resume decides which cells remain
+WORKERS="${SLURM_CPUS_PER_TASK:-8}"
+
+# ---------------- 1. build libas136.so (gfortran) ------------------------------------
+GCC_MODULE=""
+if ! command -v gfortran >/dev/null 2>&1; then
+    for m in GCC gcc foss/2022b gompi/2022b; do
+        if module load "$m" 2>/dev/null && command -v gfortran >/dev/null 2>&1; then
+            GCC_MODULE="$m"; echo "loaded module: $m"; break
+        fi
+    done
+fi
+command -v gfortran >/dev/null 2>&1 || { echo "ERROR: gfortran not found (module avail GCC)"; exit 1; }
+cd "$EXP/fortran"
+make lib
+
+# ---------------- 2. python env + single-thread pinning (RED LINE) -------------------
+module load miniconda
+source "$(conda info --base)/etc/profile.d/conda.sh"
+conda activate kmeans-jax-gpu
+export OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1 \
+       VECLIB_MAXIMUM_THREADS=1 NUMEXPR_NUM_THREADS=1 NUMBA_NUM_THREADS=1
+export JAX_PLATFORMS=cpu          # no GPU on this node; silences the cuInit plugin traceback
+cd "$REPO"
+echo "NODE=$(hostname)"; lscpu | grep -m1 "Model name"; echo "LOAD: $(uptime)"
+
+# ---------------- 3. numba gate ------------------------------------------------------
+python "$EXP/tests/test_live_sets.py"
+
+# ---------------- 4. shard + part-CSV + archive-on-exit ------------------------------
+N="${SLURM_ARRAY_TASK_COUNT:-1}"
+SHARD="${SLURM_ARRAY_TASK_ID:-0}"
+PART="$OUT/bestof_cpu_fixed_part_${SLURM_ARRAY_JOB_ID:-${SLURM_JOB_ID}}_${SHARD}.csv"
+RUN_DIR="$MB/results/logs/bestof_finish_${SLURM_ARRAY_JOB_ID:-${SLURM_JOB_ID}}"
+archive() { mkdir -p "$RUN_DIR"; cp "$PART" "$RUN_DIR"/ 2>/dev/null || true; \
+            echo "archived $PART -> $RUN_DIR"; }
+trap archive EXIT TERM
+
+# ---------------- 5. run: resume the missing CPU cells for this shard ----------------
+python "$EXP/bestof_init_benchmark.py" --backend-group cpu \
+    --init-scheme random_centroid --dims "$DIMS" --workers "$WORKERS" \
+    --shard "$SHARD" --num-shards "$N" --no-epoch2 \
+    --resume "$OUT/bestof_cpu_fixed_part_*.csv" \
+    --resume-online "$OUT/bestof_cpu.csv,$OUT/bestof_cpu_part_*.csv" \
+    --csv "$PART"
+archive
+echo "DONE — CPU finish shard $SHARD/$N (workers=$WORKERS) in $PART"
+
+# ---------------- 6. auto-continue: one successor for the WHOLE array ----------------
+# afterany, so a walltime kill still advances the chain; only task 0 submits, else 10
+# successors would be queued. Each link re-resumes from the parts written so far.
+if [ "${SLURM_ARRAY_TASK_ID:-0}" = "0" ] && [ "$CHAIN" -lt "$CHAIN_MAX" ]; then
+    NEXT=$(sbatch --parsable --dependency=afterany:"${SLURM_ARRAY_JOB_ID:-$SLURM_JOB_ID}" \
+           --export=ALL,CHAIN=$((CHAIN+1)),CHAIN_MAX="$CHAIN_MAX" "$JOBFILE" 2>/dev/null) \
+        && echo "chained successor $NEXT (link $((CHAIN+1))/$CHAIN_MAX)" \
+        || echo "chain submit failed — resubmit by hand if cells remain"
+fi
+echo "  merge when complete (--online-only DROPS the invalid pre-fix mini-batch rows by impl):"
+echo "  python $EXP/merge_bestof_csv.py $OUT/bestof_cpu_full.csv \\"
+echo "     --all $OUT/bestof_cpu_fixed_part_*.csv \\"
+echo "     --online-only $OUT/bestof_cpu.csv $OUT/bestof_cpu_part_*.csv"

@@ -1,0 +1,61 @@
+#!/bin/bash
+#SBATCH --job-name=bhjax-sweep
+#SBATCH --partition=gpu
+#SBATCH --qos=normal
+#SBATCH --gpus=1
+#SBATCH --cpus-per-task=2
+#SBATCH --mem=64G
+#SBATCH --time=08:00:00
+#SBATCH --output=bhjax-sweep-%A_%a.out
+
+# High-dimensional Batch-Hartigan convergence FAILURE-MODE sweep (JAX/GPU, float64).
+# Grid: K[2..15] x dim{100,500,1000,5000,10000} x SNR{(1,10),(4,7),(7,4),(10,1)} x
+#       cluster_size(19) = 5,320 regimes x 1000 trials.
+#
+# Runs on YCRC `partition=gpu` (RTX 5000 Ada) — we deliberately stay on the Ada and leave the
+# in-demand A100/H100 partitions for LLM training. float64 on the Ada is slow, so this is an
+# overnight run; shard across several Adas (they are plentiful) to cut the wall ~1/N:
+#
+#   single Ada :  sbatch batch_hartigan_tests/experiments/jobs/run_simulation_jax.job
+#                 (writes batch_hartigan_tests/experiments/results_jax.csv directly; no merge)
+#   N Adas     :  sbatch --array=0-3 batch_hartigan_tests/experiments/jobs/run_simulation_jax.job
+#   then merge :  cd batch_hartigan_tests/experiments && \
+#                 python merge_jax_shards.py ../results/data/results_jax.csv results_jax_shard*.csv
+#                 (the shipped copy of that file is gzipped: results/data/results_jax.csv.gz)
+#
+# The audit runs first as a set -e GATE (per node: validates that Ada's GPU + x64 + parity)
+# and aborts the sweep on any failure. Nonzero exit = red job.
+# Submit from the repository root (the Slurm log lands there); set REPO if the repository is not
+# at $HOME/kmeans-paper-repo.
+set -e
+REPO="${REPO:-$HOME/kmeans-paper-repo}"          # ---- EDIT if your layout differs ----
+EXP="$REPO/batch_hartigan_tests/experiments"
+cd "$EXP"
+
+module load miniconda
+source "$(conda info --base)/etc/profile.d/conda.sh"
+conda activate kmeans-jax-gpu
+
+export KMEANS_REQUIRE_GPU=1                      # a missing GPU / no-x64 is a RED job
+export XLA_PYTHON_CLIENT_MEM_FRACTION=0.7
+export JAX_ENABLE_X64=1                          # belt-and-suspenders (also set in-code)
+# cuBLAS f64 GEMM + no Triton autotuning (fast compile + fast f64). Delete if a flag is rejected.
+export XLA_FLAGS="--xla_gpu_autotune_level=0 --xla_gpu_enable_triton_gemm=false"
+# Persistent compile cache shared across the array shards -> each shape compiled once ever.
+export JAX_COMPILATION_CACHE_DIR="$HOME/.jax_cache"
+# Host-side detection is numpy; keep its BLAS lean (the GPU does the heavy lifting).
+export OMP_NUM_THREADS=2 OPENBLAS_NUM_THREADS=2 MKL_NUM_THREADS=2 VECLIB_MAXIMUM_THREADS=2
+
+python -c "import jax; assert jax.default_backend()=='gpu', jax.default_backend(); \
+print('jax', jax.__version__, jax.devices())"
+
+# shard bookkeeping: array job -> N shards; plain job -> single shard (N=1).
+N="${NUM_SHARDS:-${SLURM_ARRAY_TASK_COUNT:-1}}"
+K="${SLURM_ARRAY_TASK_ID:-0}"
+
+# 1) equivalence GATE (fail-loud) — each node self-validates before its sweep.
+python audit_jax_vs_numpy.py
+
+# 2) the sweep for this shard.
+python run_simulation_jax.py --shard "$K" --num-shards "$N"
+echo "DONE shard $K/$N  (merge with: python merge_jax_shards.py)"

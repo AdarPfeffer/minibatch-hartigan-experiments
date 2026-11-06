@@ -1,0 +1,129 @@
+#!/bin/bash
+#SBATCH --job-name=bestof-lloyd-f64
+#SBATCH --partition=gpu
+#SBATCH --constraint=gpu:rtx_5000_ada
+#SBATCH --nodes=1
+#SBATCH --gpus=4
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=8
+#SBATCH --mem=96G
+#SBATCH --time=08:00:00
+#SBATCH --signal=B:TERM@300
+#SBATCH --output=bestof-lloyd-f64-%j.out
+
+# Lloyd's algorithm, FLOAT64, over the full study grid — the missing baseline for the paper's
+# quality table.
+#
+# WHY THIS EXISTS. Lloyd was never part of study 1.4. The only Lloyd quality on disk is
+# `jax_results/quality_results_rerun_jax.npz` (keys `nmi_lloyd` / `sse_lloyd`, shape
+# (7,3,3,100), fully populated, same generative parameters — noise 10.0, prior 1.0 — and its N grid
+# {32,83,217,565,1473,3838,10000} is a subset of the current 15-point grid). It cannot fill the
+# table for three reasons:
+#   1. ONE value per trial, NO per-init axis. Every quality figure in study 1.4 is min-SSE selected
+#      over 50 inits. A single-init Lloyd next to best-of-50 Hartigan understates Lloyd badly and
+#      would not survive review.
+#   2. It is float32 JAX; the mini-batch column of the table is float64 (study 1.11).
+#   3. Different dataset draws, so it is not paired with any current row.
+# That file's MINI-BATCH arm is separately unusable — its proportions include 0.95, i.e. it predates
+# the mini-batch empty-cluster fix. Its Lloyd and online arms are unaffected by that bug.
+#
+# WHAT THIS PRODUCES. `jax_lloyd` rows on exactly the study's datasets and initialisations, scored
+# by the same `sse_f64` / `nmi_score`, aggregated by the same `aggregate()`, keyed identically —
+# so they join the existing tables on (init_scheme, impl, d, N, K, proportion, dataset_id) with no
+# reconciliation. proportion is -1 and there is ONE row per cell, like the online impls
+# (Lloyd has no batch), so 13,500 rows total.
+#
+# CARD CHOICE, AND ITS ONE LIMIT. The Ada, because `gpu` queues in minutes where `gpu_h200`
+# routinely waits a day, and because QUALITY is card-independent: at float64 the partition a
+# deterministic algorithm reaches from a fixed init does not depend on GEMM tiling (§1.11 measured
+# 0 certification failures and cross-device stability at f64; it is float32 where tiling changes
+# decisions).
+#   *** THEREFORE: use these rows for QUALITY ONLY. ***
+# conv_mean_s here is an Ada number and must NOT be placed beside the H200 mini-batch timings in
+# §1.11 — that is the §4b mistake. If a Lloyd RUNTIME column is ever wanted alongside them, re-run
+# this on gpu_h200. singleit_mean_s and epoch2_mean_s are NaN by construction (see the runner's
+# docstring: _run_lloyd_inner does its own init inside the jitted while_loop, so there is no
+# post-init clock comparable to the other impls, and emitting one would mix init cost into a
+# per-iteration figure).
+#
+# FLOAT64 is asserted in a child process before any GPU time is spent, because JAX_ENABLE_X64 is
+# what the shards actually depend on and a silent float32 run would be worthless here.
+#
+# NO XLA_FLAGS — job 22096806 measured that the autotune/triton flags change GEMM kernel selection
+# and the centroid summation class. Default flags are what a user gets.
+#
+#   sbatch minibatch_hartigan_tests/experiments/jobs/run_bestof_lloyd.job
+# Submit from the repository root. Re-submittable: --resume skips completed (impl, d, N, K, dataset_id) cells.
+set -e
+set -o pipefail
+REPO="${REPO:-$HOME/kmeans-paper-repo}"          # ---- EDIT if the repository lives elsewhere ----
+MB="$REPO/minibatch_hartigan_tests"; EXP="$MB/experiments"; OUT="$MB/results/data/random_centroid"
+mkdir -p "$OUT"
+cd "$REPO"
+
+# ---------------- 1. provenance -------------------------------------------------------
+echo "JOB=$SLURM_JOB_ID"; echo "NODE=$(hostname)"
+lscpu | grep -m1 "Model name" || true
+nvidia-smi --query-gpu=name,memory.total,compute_cap,driver_version --format=csv || true
+NGPU=$(nvidia-smi --list-gpus | wc -l); echo "visible GPUs: $NGPU"
+
+# ---------------- 3. python env -------------------------------------------------------
+module load miniconda
+source "$(conda info --base)/etc/profile.d/conda.sh"
+conda activate kmeans-jax-gpu
+export OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1 \
+       VECLIB_MAXIMUM_THREADS=1 NUMEXPR_NUM_THREADS=1 NUMBA_NUM_THREADS=1
+export XLA_PYTHON_CLIENT_MEM_FRACTION=0.7
+export JAX_ENABLE_X64=1                     # the float64 arm — asserted below
+export JAX_COMPILATION_CACHE_DIR="$HOME/.jax_cache"
+unset XLA_FLAGS
+cd "$REPO"
+
+CUDA_VISIBLE_DEVICES=0 python -c "
+import sys, jax, jax.numpy as jnp
+assert jax.default_backend()=='gpu', jax.default_backend()
+assert jax.config.read('jax_enable_x64'), 'JAX_ENABLE_X64=1 did not take effect'
+assert jnp.asarray([1.0]).dtype == jnp.float64, jnp.asarray([1.0]).dtype
+sys.path.insert(0, '$EXP')
+from _lloyd import run_lloyd_kmeans
+print('float64 on GPU confirmed:', jnp.asarray([1.0]).dtype, jax.devices())"
+
+# ---------------- 4. archive-on-exit --------------------------------------------------
+RUN_DIR="$MB/results/logs/lloyd_${SLURM_JOB_ID}"; mkdir -p "$RUN_DIR"
+NSHARD=$NGPU
+[ "$NSHARD" -ge 1 ] || { echo "ERROR: no GPU visible"; exit 1; }
+archive() {
+    for k in $(seq 0 $((NSHARD-1))); do
+        cp "$OUT/bestof_lloyd_part_${SLURM_JOB_ID}_${k}.csv" \
+           "$RUN_DIR"/ 2>/dev/null || true
+    done
+    echo "archived parts -> $RUN_DIR"
+}
+trap archive EXIT TERM
+
+# ---------------- 5. run: one shard per GPU -------------------------------------------
+echo; echo "=== jax_lloyd, FLOAT64, $NSHARD shards ==="
+set +e                                      # one shard dying must not kill the others
+for k in $(seq 0 $((NSHARD-1))); do
+    PART="$OUT/bestof_lloyd_part_${SLURM_JOB_ID}_${k}.csv"
+    CUDA_VISIBLE_DEVICES=$k python "$EXP/bestof_init_benchmark.py" \
+        --backend-group gpu --init-scheme random_centroid --workers 1 \
+        --impls jax_lloyd --no-epoch2 \
+        --shard "$k" --num-shards "$NSHARD" \
+        --resume "$OUT/bestof_lloyd_part_*.csv" \
+        --csv "$PART" > "$RUN_DIR/shard_${k}.log" 2>&1 &
+    echo "launched shard $k on GPU $k (pid $!) -> $PART"
+done
+wait
+archive
+
+echo
+echo "DONE — jax_lloyd float64. Re-submit until every shard log says 'nothing to do'."
+echo "Expect 13,500 rows (one per cell; Lloyd is not swept over proportions)."
+echo
+echo "MERGE INTO ITS OWN TABLE:"
+echo "  python $EXP/merge_bestof_csv.py $OUT/bestof_lloyd_f64.csv \\"
+echo "    $OUT/bestof_lloyd_part_*.csv"
+echo
+echo "USE FOR QUALITY ONLY — conv_mean_s is an Ada number and does not belong beside the H200"
+echo "  timings in TESTS.md 1.11. singleit/epoch2 are NaN by construction."
